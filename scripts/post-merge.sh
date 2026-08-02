@@ -59,7 +59,7 @@ else
     ) || echo "⚠️   $label template push skipped — remote not configured or push failed. Run manually: scripts/push-to-product-repos.sh $product"
   }
 
-  $PUSH_CRM     && _push_safe crm     "CRM"
-  $PUSH_MOBILE  && _push_safe mobile  "Mobile"
-  $PUSH_WEBSITE && _push_safe website "Website"
+  if $PUSH_CRM;     then _push_safe crm     "CRM";     fi
+  if $PUSH_MOBILE;  then _push_safe mobile  "Mobile";  fi
+  if $PUSH_WEBSITE; then _push_safe website "Website"; fi
 fi
