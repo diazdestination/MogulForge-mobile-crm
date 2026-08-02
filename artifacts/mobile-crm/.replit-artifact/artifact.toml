@@ -1,0 +1,24 @@
+kind = "mobile"
+previewPath = "/mobile/"
+title = "Painless CRM Mobile"
+description = "A mobile companion app to the Painless Command Center for roofing sales reps and inspectors in the field. Lets them sign in with Replit Auth, browse the lead pipeline, view lead details, update lead statuses after inspections, manage tasks and appointments, and log activity notes on site."
+version = "1.0.0"
+id = "artifacts/mobile-crm"
+router = "expo-domain"
+
+[[services]]
+name = "expo"
+ensurePreviewReachable = "/status"
+paths = [ "/mobile/" ]
+localPort = 22891
+
+[services.development]
+run = "pnpm --filter @workspace/mobile-crm run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/mobile-crm", "run", "build" ]
+run = [ "pnpm", "--filter", "@workspace/mobile-crm", "run", "serve" ]
+
+[services.env]
+PORT = "22891"
+BASE_PATH = "/mobile/"
