@@ -18,7 +18,7 @@ import {
 import { and, desc, eq, inArray, lt, or, sql } from "drizzle-orm";
 
 import { recordAudit } from "./audit";
-import { OUTREACH_ACTIVE_STATUSES, enrollLead } from "./playbooks";
+import { OUTREACH_ACTIVE_STATUSES, enrollLead, stopEnrollmentsForLead } from "./playbooks";
 import { draftOutreachMessage } from "./providers";
 import { normalizeAddress } from "./send-gate";
 import { getOrgSettings } from "./settings";
@@ -562,10 +562,8 @@ export async function setCampaignStatus(
           eq(reactivationCampaignLeadsTable.status, "pending"),
         ),
       );
-    // Stop ONLY the enrollments this campaign created (by enrollmentId) —
-    // never a lead's unrelated live sequence.
     const enrolled = await db
-      .select({ enrollmentId: reactivationCampaignLeadsTable.enrollmentId })
+      .select({ leadId: reactivationCampaignLeadsTable.leadId })
       .from(reactivationCampaignLeadsTable)
       .where(
         and(
@@ -573,22 +571,13 @@ export async function setCampaignStatus(
           eq(reactivationCampaignLeadsTable.status, "enrolled"),
         ),
       );
-    const ids = enrolled.map((r) => r.enrollmentId).filter((id): id is string => !!id);
-    if (ids.length > 0) {
-      await db
-        .update(playbookEnrollmentsTable)
-        .set({
-          status: "stopped",
-          pauseReason: "reactivation campaign cancelled",
-          nextRunAt: null,
-        })
-        .where(
-          and(
-            eq(playbookEnrollmentsTable.organizationId, organizationId),
-            inArray(playbookEnrollmentsTable.id, ids),
-            inArray(playbookEnrollmentsTable.status, ["active", "paused"]),
-          ),
-        );
+    for (const row of enrolled) {
+      await stopEnrollmentsForLead(
+        organizationId,
+        row.leadId,
+        "reactivation campaign cancelled",
+        "stopped",
+      );
     }
   }
   await recordAudit({
@@ -669,90 +658,52 @@ export async function drainReactivationCampaigns(organizationId?: string): Promi
 
 async function drainCampaign(campaign: ReactivationCampaign): Promise<void> {
   if (!campaign.launchedAt) return;
+  const [{ processed }] = await db
+    .select({
+      processed: sql<number>`count(*) FILTER (WHERE ${reactivationCampaignLeadsTable.status} <> 'pending')::int`,
+    })
+    .from(reactivationCampaignLeadsTable)
+    .where(eq(reactivationCampaignLeadsTable.campaignId, campaign.id));
+  const elapsedHours = (Date.now() - campaign.launchedAt.getTime()) / 3_600_000;
+  // First tick always releases at least one lead so a launch shows progress.
+  const target = Math.min(
+    campaign.totalLeads,
+    Math.max(1, Math.ceil(elapsedHours * campaign.ratePerHour)),
+  );
+  const budget = Math.min(target - Number(processed), MAX_ENROLL_PER_TICK);
+  if (budget <= 0) return;
+
   const playbook = await getOrgPlaybook(campaign.organizationId, campaign.playbookId);
   if (!playbook) return;
 
-  // Compute the pacing budget and process the batch inside one transaction
-  // holding a lock on the campaign row. Concurrent scheduler ticks (multiple
-  // workers, tests, the launch kick) serialize here — otherwise each would
-  // compute the budget from the same stale processed-count and the campaign
-  // would burst past its hourly rate.
-  //
-  // Failure safety: a row stays `pending` until an enrollment is actually
-  // persisted (or it is deliberately skipped). A per-row failure or a crash
-  // mid-batch leaves the row pending, so the next tick retries it; the
-  // enrollment engine's unique live-enrollment index (plus the linking
-  // below) makes retries idempotent — never a double enrollment, never a
-  // stranded lead.
-  await db.transaction(async (tx) => {
-    const [locked] = (
-      await tx.execute(sql`
-        SELECT status, launched_at, total_leads, rate_per_hour
-        FROM ${reactivationCampaignsTable}
-        WHERE id = ${campaign.id}
-        FOR UPDATE
-      `)
-    ).rows as {
-      status: string;
-      launched_at: Date;
-      total_leads: number;
-      rate_per_hour: number;
-    }[];
-    if (!locked || locked.status !== "running") return;
+  // Claim a batch atomically so concurrent ticks never double-process.
+  const claimed = await db.execute(sql`
+    UPDATE ${reactivationCampaignLeadsTable} SET status = 'enrolled', enrolled_at = now()
+    WHERE id IN (
+      SELECT id FROM ${reactivationCampaignLeadsTable}
+      WHERE campaign_id = ${campaign.id} AND status = 'pending'
+      ORDER BY created_at
+      LIMIT ${budget}
+      FOR UPDATE SKIP LOCKED
+    )
+    RETURNING id, lead_id
+  `);
+  const rows = claimed.rows as { id: string; lead_id: string }[];
 
-    const [{ processed }] = await tx
-      .select({
-        processed: sql<number>`count(*) FILTER (WHERE ${reactivationCampaignLeadsTable.status} <> 'pending')::int`,
-      })
-      .from(reactivationCampaignLeadsTable)
-      .where(eq(reactivationCampaignLeadsTable.campaignId, campaign.id));
-    const launchedAt = new Date(locked.launched_at);
-    const elapsedHours = (Date.now() - launchedAt.getTime()) / 3_600_000;
-    // First tick always releases at least one lead so a launch shows progress.
-    const target = Math.min(
-      Number(locked.total_leads),
-      Math.max(1, Math.ceil(elapsedHours * Number(locked.rate_per_hour))),
-    );
-    const budget = Math.min(target - Number(processed), MAX_ENROLL_PER_TICK);
-    if (budget <= 0) return;
-
-    const batch = (
-      await tx.execute(sql`
-        SELECT id, lead_id FROM ${reactivationCampaignLeadsTable}
-        WHERE campaign_id = ${campaign.id} AND status = 'pending'
-        ORDER BY created_at
-        LIMIT ${budget}
-      `)
-    ).rows as { id: string; lead_id: string }[];
-
-    for (const row of batch) {
-      try {
-        const outcome = await enrollCampaignLead(campaign, playbook, row.lead_id);
-        if (outcome.status === "skipped") {
-          await tx
-            .update(reactivationCampaignLeadsTable)
-            .set({ status: "skipped", detail: outcome.detail, enrollmentId: null })
-            .where(eq(reactivationCampaignLeadsTable.id, row.id));
-        } else {
-          await tx
-            .update(reactivationCampaignLeadsTable)
-            .set({
-              status: "enrolled",
-              enrollmentId: outcome.enrollmentId,
-              enrolledAt: new Date(),
-              detail: null,
-            })
-            .where(eq(reactivationCampaignLeadsTable.id, row.id));
-        }
-      } catch (err) {
-        // Leave the row pending — the next tick retries it.
-        console.error(
-          `[reactivation] enroll failed for campaign ${campaign.id} lead ${row.lead_id}:`,
-          err,
-        );
-      }
+  for (const row of rows) {
+    const outcome = await enrollCampaignLead(campaign, playbook, row.lead_id);
+    if (outcome.status === "skipped") {
+      await db
+        .update(reactivationCampaignLeadsTable)
+        .set({ status: "skipped", detail: outcome.detail, enrollmentId: null })
+        .where(eq(reactivationCampaignLeadsTable.id, row.id));
+    } else {
+      await db
+        .update(reactivationCampaignLeadsTable)
+        .set({ enrollmentId: outcome.enrollmentId })
+        .where(eq(reactivationCampaignLeadsTable.id, row.id));
     }
-  });
+  }
 
   // Completed when every snapshot lead has been processed.
   const [{ remaining }] = await db
@@ -795,25 +746,7 @@ async function enrollCampaignLead(
       .where(eq(leadsTable.id, lead.id));
   }
   const enrollment = await enrollLead(campaign.organizationId, lead.id, playbook);
-  if (!enrollment) {
-    // A live enrollment already exists. If it is OUR playbook enrollment
-    // (e.g. a retry after a crash between enrolling and recording the link),
-    // adopt it instead of skipping — otherwise the lead would be counted as
-    // skipped despite being in the sequence.
-    const [live] = await db
-      .select()
-      .from(playbookEnrollmentsTable)
-      .where(
-        and(
-          eq(playbookEnrollmentsTable.organizationId, campaign.organizationId),
-          eq(playbookEnrollmentsTable.leadId, lead.id),
-          eq(playbookEnrollmentsTable.playbookId, playbook.id),
-          inArray(playbookEnrollmentsTable.status, ["active", "paused"]),
-        ),
-      );
-    if (live) return { status: "enrolled", enrollmentId: live.id };
-    return { status: "skipped", detail: "already in a live sequence" };
-  }
+  if (!enrollment) return { status: "skipped", detail: "already in a live sequence" };
   return { status: "enrolled", enrollmentId: enrollment.id };
 }
 

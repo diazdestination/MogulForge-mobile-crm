@@ -934,6 +934,13 @@ async function processDueScheduledActions(organizationId?: string): Promise<void
  *   pending actions or processing each other's webhook deliveries.
  */
 export async function processScheduledWork(organizationId?: string): Promise<void> {
+  // Throttled reactivation campaigns release their next batch of leads into
+  // playbook sequences before due steps are executed. Dynamic import avoids a
+  // static circular dependency (reactivation → playbooks → automation types).
+  await runStage("reactivation-drain", async () => {
+    const { drainReactivationCampaigns } = await import("./reactivation");
+    await drainReactivationCampaigns(organizationId);
+  });
   await runStage("scheduled-actions", () => processDueScheduledActions(organizationId));
   // Throttled reactivation campaigns release their next batch of leads into
   // playbook sequences (their first step becomes due on a later tick).

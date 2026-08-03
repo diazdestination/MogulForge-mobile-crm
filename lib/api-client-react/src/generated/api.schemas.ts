@@ -2688,4 +2688,3 @@ endpointId?: string;
 export type LogoutPortalSession200 = {
   ok: boolean;
 };
-

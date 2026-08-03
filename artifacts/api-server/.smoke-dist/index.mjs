@@ -47281,24 +47281,18 @@ async function setCampaignStatus(organizationId, campaignId, action) {
         eq(reactivationCampaignLeadsTable.status, "pending")
       )
     );
-    const enrolled = await db.select({ enrollmentId: reactivationCampaignLeadsTable.enrollmentId }).from(reactivationCampaignLeadsTable).where(
+    const enrolled = await db.select({ leadId: reactivationCampaignLeadsTable.leadId }).from(reactivationCampaignLeadsTable).where(
       and(
         eq(reactivationCampaignLeadsTable.campaignId, campaignId),
         eq(reactivationCampaignLeadsTable.status, "enrolled")
       )
     );
-    const ids = enrolled.map((r) => r.enrollmentId).filter((id) => !!id);
-    if (ids.length > 0) {
-      await db.update(playbookEnrollmentsTable).set({
-        status: "stopped",
-        pauseReason: "reactivation campaign cancelled",
-        nextRunAt: null
-      }).where(
-        and(
-          eq(playbookEnrollmentsTable.organizationId, organizationId),
-          inArray(playbookEnrollmentsTable.id, ids),
-          inArray(playbookEnrollmentsTable.status, ["active", "paused"])
-        )
+    for (const row of enrolled) {
+      await stopEnrollmentsForLead(
+        organizationId,
+        row.leadId,
+        "reactivation campaign cancelled",
+        "stopped"
       );
     }
   }
@@ -47351,54 +47345,38 @@ async function drainReactivationCampaigns(organizationId) {
 }
 async function drainCampaign(campaign) {
   if (!campaign.launchedAt) return;
+  const [{ processed }] = await db.select({
+    processed: sql`count(*) FILTER (WHERE ${reactivationCampaignLeadsTable.status} <> 'pending')::int`
+  }).from(reactivationCampaignLeadsTable).where(eq(reactivationCampaignLeadsTable.campaignId, campaign.id));
+  const elapsedHours = (Date.now() - campaign.launchedAt.getTime()) / 36e5;
+  const target = Math.min(
+    campaign.totalLeads,
+    Math.max(1, Math.ceil(elapsedHours * campaign.ratePerHour))
+  );
+  const budget = Math.min(target - Number(processed), MAX_ENROLL_PER_TICK);
+  if (budget <= 0) return;
   const playbook = await getOrgPlaybook(campaign.organizationId, campaign.playbookId);
   if (!playbook) return;
-  await db.transaction(async (tx) => {
-    const [locked] = (await tx.execute(sql`
-        SELECT status, launched_at, total_leads, rate_per_hour
-        FROM ${reactivationCampaignsTable}
-        WHERE id = ${campaign.id}
-        FOR UPDATE
-      `)).rows;
-    if (!locked || locked.status !== "running") return;
-    const [{ processed }] = await tx.select({
-      processed: sql`count(*) FILTER (WHERE ${reactivationCampaignLeadsTable.status} <> 'pending')::int`
-    }).from(reactivationCampaignLeadsTable).where(eq(reactivationCampaignLeadsTable.campaignId, campaign.id));
-    const launchedAt = new Date(locked.launched_at);
-    const elapsedHours = (Date.now() - launchedAt.getTime()) / 36e5;
-    const target = Math.min(
-      Number(locked.total_leads),
-      Math.max(1, Math.ceil(elapsedHours * Number(locked.rate_per_hour)))
-    );
-    const budget = Math.min(target - Number(processed), MAX_ENROLL_PER_TICK);
-    if (budget <= 0) return;
-    const batch = (await tx.execute(sql`
-        SELECT id, lead_id FROM ${reactivationCampaignLeadsTable}
-        WHERE campaign_id = ${campaign.id} AND status = 'pending'
-        ORDER BY created_at
-        LIMIT ${budget}
-      `)).rows;
-    for (const row of batch) {
-      try {
-        const outcome = await enrollCampaignLead(campaign, playbook, row.lead_id);
-        if (outcome.status === "skipped") {
-          await tx.update(reactivationCampaignLeadsTable).set({ status: "skipped", detail: outcome.detail, enrollmentId: null }).where(eq(reactivationCampaignLeadsTable.id, row.id));
-        } else {
-          await tx.update(reactivationCampaignLeadsTable).set({
-            status: "enrolled",
-            enrollmentId: outcome.enrollmentId,
-            enrolledAt: /* @__PURE__ */ new Date(),
-            detail: null
-          }).where(eq(reactivationCampaignLeadsTable.id, row.id));
-        }
-      } catch (err) {
-        console.error(
-          `[reactivation] enroll failed for campaign ${campaign.id} lead ${row.lead_id}:`,
-          err
-        );
-      }
+  const claimed = await db.execute(sql`
+    UPDATE ${reactivationCampaignLeadsTable} SET status = 'enrolled', enrolled_at = now()
+    WHERE id IN (
+      SELECT id FROM ${reactivationCampaignLeadsTable}
+      WHERE campaign_id = ${campaign.id} AND status = 'pending'
+      ORDER BY created_at
+      LIMIT ${budget}
+      FOR UPDATE SKIP LOCKED
+    )
+    RETURNING id, lead_id
+  `);
+  const rows = claimed.rows;
+  for (const row of rows) {
+    const outcome = await enrollCampaignLead(campaign, playbook, row.lead_id);
+    if (outcome.status === "skipped") {
+      await db.update(reactivationCampaignLeadsTable).set({ status: "skipped", detail: outcome.detail, enrollmentId: null }).where(eq(reactivationCampaignLeadsTable.id, row.id));
+    } else {
+      await db.update(reactivationCampaignLeadsTable).set({ enrollmentId: outcome.enrollmentId }).where(eq(reactivationCampaignLeadsTable.id, row.id));
     }
-  });
+  }
   const [{ remaining }] = await db.select({
     remaining: sql`count(*) FILTER (WHERE ${reactivationCampaignLeadsTable.status} = 'pending')::int`
   }).from(reactivationCampaignLeadsTable).where(eq(reactivationCampaignLeadsTable.campaignId, campaign.id));
@@ -47418,18 +47396,7 @@ async function enrollCampaignLead(campaign, playbook, leadId) {
     await db.update(leadsTable).set({ status: "nurture" }).where(eq(leadsTable.id, lead.id));
   }
   const enrollment = await enrollLead(campaign.organizationId, lead.id, playbook);
-  if (!enrollment) {
-    const [live] = await db.select().from(playbookEnrollmentsTable).where(
-      and(
-        eq(playbookEnrollmentsTable.organizationId, campaign.organizationId),
-        eq(playbookEnrollmentsTable.leadId, lead.id),
-        eq(playbookEnrollmentsTable.playbookId, playbook.id),
-        inArray(playbookEnrollmentsTable.status, ["active", "paused"])
-      )
-    );
-    if (live) return { status: "enrolled", enrollmentId: live.id };
-    return { status: "skipped", detail: "already in a live sequence" };
-  }
+  if (!enrollment) return { status: "skipped", detail: "already in a live sequence" };
   return { status: "enrolled", enrollmentId: enrollment.id };
 }
 async function previewOutreach(organizationId, params) {
@@ -51460,6 +51427,10 @@ async function processDueScheduledActions(organizationId) {
   }
 }
 async function processScheduledWork(organizationId) {
+  await runStage("reactivation-drain", async () => {
+    const { drainReactivationCampaigns: drainReactivationCampaigns2 } = await Promise.resolve().then(() => (init_reactivation2(), reactivation_exports));
+    await drainReactivationCampaigns2(organizationId);
+  });
   await runStage("scheduled-actions", () => processDueScheduledActions(organizationId));
   await runStage("reactivation-drain", async () => {
     const { drainReactivationCampaigns: drainReactivationCampaigns2 } = await Promise.resolve().then(() => (init_reactivation2(), reactivation_exports));

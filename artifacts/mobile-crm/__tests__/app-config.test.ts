@@ -52,3 +52,24 @@ describe('app.config driven by client.config', () => {
     expect(resolved.android!.package).toBe(CLIENT.androidPackage);
   });
 });
+
+describe('client.config format validation', () => {
+  const slugPattern = /^[a-z0-9-]+$/;
+  const reverseDnsPattern = /^[a-z][a-z0-9]*(\.[a-z][a-z0-9]*){2,}$/i;
+
+  it('appSlug is lowercase letters, numbers, and hyphens only', () => {
+    expect(CLIENT.appSlug).toMatch(slugPattern);
+  });
+
+  it('appScheme is lowercase letters, numbers, and hyphens only', () => {
+    expect(CLIENT.appScheme).toMatch(slugPattern);
+  });
+
+  it('iosBundleId is a valid reverse-DNS identifier (at least 3 segments)', () => {
+    expect(CLIENT.iosBundleId).toMatch(reverseDnsPattern);
+  });
+
+  it('androidPackage is a valid reverse-DNS identifier (at least 3 segments)', () => {
+    expect(CLIENT.androidPackage).toMatch(reverseDnsPattern);
+  });
+});
