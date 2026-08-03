@@ -19,6 +19,7 @@ import { useAuth } from '@/lib/auth';
 import { useColors } from '@/hooks/useColors';
 import { Badge, Card, ErrorState, LoadingView } from '@/components/ui';
 import { SecurityAlertsBanner } from '@/components/SecurityAlertsBanner';
+import { TodayActions } from '@/components/TodayActions';
 import {
   LEAD_STATUS_COLORS,
   LEAD_STATUS_LABELS,
@@ -132,6 +133,8 @@ export default function DashboardScreen() {
         </View>
         <Feather name="chevron-right" size={18} color={c.mutedForeground} />
       </Card>
+
+      <TodayActions />
 
       <Text style={[styles.sectionTitle, { color: c.foreground }]}>Pipeline</Text>
       <Card style={{ gap: 10 }}>
